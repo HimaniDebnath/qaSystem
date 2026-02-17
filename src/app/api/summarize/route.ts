@@ -53,6 +53,7 @@ export async function POST(req: NextRequest) {
 
         let transcriptText = "";
         let isFallback = false;
+        let fallbackSource = "none";
 
         // --- PHASE 1: TRANSCRIPT EXTRACTION ---
         try {
@@ -82,40 +83,64 @@ export async function POST(req: NextRequest) {
                 const snippets = (fetched as any).snippets || fetched;
                 if (snippets && Array.isArray(snippets) && snippets.length > 0) {
                     transcriptText = snippets.map((s: any) => s.text).join(" ");
+                    fallbackSource = "transcript";
                 }
             }
         } catch (e: any) {
-            console.warn(`[Phase 1] Transcript extraction failed: ${e.message}. Moving to fallback.`);
+            console.warn(`[Phase 1] Transcript extraction failed: ${e.message}`);
         }
 
-        // --- PHASE 2: METADATA FALLBACK ---
+        // --- PHASE 2: YTDL METADATA FALLBACK ---
         if (!transcriptText || transcriptText.length < 50) {
-            console.log(`[Phase 2] Using Metadata Fallback for: ${videoId}`);
+            console.log(`[Phase 2] Attempting YTDL metadata fallback for: ${videoId}`);
             try {
                 const info = await ytdl.getBasicInfo(videoId);
                 const title = info.videoDetails.title;
                 const description = info.videoDetails.description || "";
 
-                transcriptText = `VIDEO TITLE: ${title}\n\nVIDEO DESCRIPTION:\n${description}`;
-                isFallback = true;
-
-                if (!title) throw new Error("Could not retrieve video metadata");
+                if (title) {
+                    transcriptText = `VIDEO TITLE: ${title}\n\nVIDEO DESCRIPTION:\n${description}`;
+                    isFallback = true;
+                    fallbackSource = "ytdl";
+                }
             } catch (fallbackError: any) {
-                console.error("[Phase 2] Fallback failed:", fallbackError);
-                return NextResponse.json({
-                    error: "Could not retrieve transcript or video information. This video might be highly restricted or private."
-                }, { status: 500 });
+                console.warn("[Phase 2] YTDL fallback failed:", fallbackError.message);
             }
         }
 
-        // --- PHASE 3: AI GENERATION ---
-        console.log(`[Summarize] Generating ${isFallback ? 'metadata' : 'transcript'} summary...`);
-        const contextType = isFallback ? "video metadata (title and description)" : "video transcript";
+        // --- PHASE 3: OEMBED FALLBACK (Ultimate Resilience) ---
+        if (!transcriptText || transcriptText.length < 10) {
+            console.log(`[Phase 3] Attempting OEmbed fallback for: ${videoId}`);
+            try {
+                const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+                const res = await fetch(oembedUrl);
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.title) {
+                        transcriptText = `VIDEO TITLE: ${data.title}\nAUTHOR: ${data.author_name}\n\n(Note: Only basic metadata could be retrieved for this video.)`;
+                        isFallback = true;
+                        fallbackSource = "oembed";
+                    }
+                }
+            } catch (oembedError: any) {
+                console.error("[Phase 3] OEmbed fallback failed:", oembedError.message);
+            }
+        }
+
+        if (!transcriptText || transcriptText.length < 10) {
+            return NextResponse.json({
+                error: "YouTube is blocking access to this video's information. This often happens with restricted, music, or age-gated videos on serverless environments. Please try a different video."
+            }, { status: 500 });
+        }
+
+        // --- PHASE 4: AI GENERATION ---
+        console.log(`[Summarize] Generating summary from ${fallbackSource}...`);
+        const contextType = isFallback ? "video metadata" : "video transcript";
         const prompt = `Analyze the following ${contextType} and provide:
         1. A concise summary of the main points (2-3 paragraphs).
         2. Structured study notes in Markdown format, with clear headings and bullet points.
         
-        Keep in mind that this information comes from the ${contextType}.
+        Note: If only a title and description/author are provided, generate the best possible summary based on that context.
         
         Return the result in this exact JSON format:
         {
@@ -123,7 +148,7 @@ export async function POST(req: NextRequest) {
           "notes": "## Study Notes\\n### Topic\\n..."
         }
 
-        Content:
+        Content to analyze:
         ${transcriptText.substring(0, 30000)}
         `;
 
@@ -139,7 +164,8 @@ export async function POST(req: NextRequest) {
             ...aiData,
             transcript: transcriptText,
             isMetadataSummary: isFallback,
-            message: isFallback ? "Note: Summary generated from video metadata because transcripts were unavailable." : undefined
+            fallbackSource: fallbackSource,
+            message: isFallback ? "Note: Summary generated from video metadata because transcripts were blocked or unavailable." : undefined
         });
 
     } catch (error: any) {
