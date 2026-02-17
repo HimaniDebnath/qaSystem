@@ -1,11 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { YoutubeTranscript } from "youtube-transcript";
-import ytdl from "@distube/ytdl-core";
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 export const maxDuration = 60;
-
-const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 async function callGroq(prompt: string): Promise<string> {
     const groqApiKey = process.env.GROQ_API_KEY;
@@ -44,6 +40,8 @@ export async function POST(req: NextRequest) {
         const body = await req.json().catch(() => ({}));
         const { url } = body;
 
+        console.log(`[Summarize] Processing URL: ${url}`);
+
         if (!url) return NextResponse.json({ error: "URL is required" }, { status: 400 });
         if (!process.env.GROQ_API_KEY) return NextResponse.json({ error: "Groq API Key missing" }, { status: 500 });
 
@@ -55,73 +53,36 @@ export async function POST(req: NextRequest) {
         let transcriptText = "";
 
         // --- PHASE 1: TRANSCRIPT EXTRACTION ---
-
-        // method 1: YoutubeTranscript
         try {
-            console.log(`[Phase 1.1] YoutubeTranscript for: ${videoId}`);
-            const transcript = await YoutubeTranscript.fetchTranscript(videoId);
-            if (transcript && transcript.length > 0) {
-                transcriptText = transcript.map(t => t.text).join(" ");
-                console.log(`[Phase 1.1] Success (${transcriptText.length} chars)`);
+            console.log(`[Phase 1] Using YouTubeTranscriptApi for: ${videoId}`);
+            const { YouTubeTranscriptApi } = await import("youtube-transcript-node");
+            const api = new YouTubeTranscriptApi();
+
+            // Try fetching with default languages
+            const transcript = await api.fetch(videoId);
+
+            // The library returns a FetchedTranscript object with a 'snippets' property
+            // We can also iterate over it directly as it implements Symbol.iterator
+            const snippets = (transcript as any).snippets || transcript;
+
+            if (snippets && Array.isArray(snippets) && snippets.length > 0) {
+                transcriptText = snippets.map((s: any) => s.text).join(" ");
+                console.log(`[Phase 1] Success! Extracted ${transcriptText.length} characters.`);
+            } else if (typeof transcript === 'object' && transcript !== null) {
+                // Handle cases where the object might have a different structure
+                console.log("[Phase 1] Transcript structure:", Object.keys(transcript));
             }
-        } catch (e) {
-            console.warn("[Phase 1.1] Failed:", e instanceof Error ? e.message : "Unknown error");
-        }
+        } catch (e: any) {
+            console.error("[Phase 1] Extraction failed:", e.message || e);
 
-        // method 2: ytdl-core metadata (Fallback)
-        if (!transcriptText || transcriptText.length < 100) {
-            try {
-                console.log(`[Phase 1.2] @distube/ytdl-core metadata for: ${videoId}`);
-                const info = await ytdl.getInfo(url, {
-                    requestOptions: {
-                        headers: {
-                            "User-Agent": USER_AGENT,
-                        }
-                    }
-                });
-
-                const tracks = info.player_response.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-
-                if (tracks && tracks.length > 0) {
-                    // Try to find English, then auto English, then any
-                    const track = tracks.find((t: any) => t.languageCode === 'en' && !t.kind) ||
-                        tracks.find((t: any) => t.languageCode === 'en') ||
-                        tracks.find((t: any) => t.languageCode.startsWith('en')) ||
-                        tracks[0];
-
-                    if (track) {
-                        console.log(`[Phase 1.2] Found track: ${track.languageCode} (${track.kind || 'manual'})`);
-                        const res = await fetch(track.baseUrl, {
-                            headers: { "User-Agent": USER_AGENT }
-                        });
-                        const xml = await res.text();
-
-                        const cleaned = xml
-                            .replace(/<[^>]+>/g, ' ')
-                            .replace(/&amp;/g, '&')
-                            .replace(/&lt;/g, '<')
-                            .replace(/&gt;/g, '>')
-                            .replace(/&quot;/g, '"')
-                            .replace(/&#39;/g, "'")
-                            .replace(/&nbsp;/g, ' ')
-                            .replace(/\s+/g, ' ')
-                            .trim();
-
-                        if (cleaned.length > 50) { // Lowered threshold slightly
-                            transcriptText = cleaned;
-                            console.log(`[Phase 1.2] Success (${transcriptText.length} chars)`);
-                        }
-                    }
-                } else {
-                    console.log("[Phase 1.2] No caption tracks found in metadata");
-                }
-            } catch (e) {
-                console.warn("[Phase 1.2] Failed:", e instanceof Error ? e.message : "Unknown error");
+            // Fallback error messaging
+            if (e.message?.includes("Transcripts are disabled")) {
+                return NextResponse.json({ error: "Transcripts are disabled for this video." }, { status: 500 });
             }
         }
 
-        if (transcriptText && transcriptText.length > 50) {
-            console.log("[Groq] Processing via Transcript");
+        if (transcriptText && transcriptText.length > 30) {
+            console.log(`[Summarize] Generating AI summary...`);
             const prompt = `Analyze the following YouTube transcript and provide:
             1. A concise summary of the main points (2-3 paragraphs).
             2. Structured study notes in Markdown format, with clear headings and bullet points.
@@ -129,7 +90,7 @@ export async function POST(req: NextRequest) {
             Return the result in this exact JSON format:
             {
               "summary": "The summary text...",
-              "notes": "## Study Notes\\n### Introduction\\n- Point 1..."
+              "notes": "## Study Notes\\n### Topic\\n..."
             }
 
             Transcript:
@@ -141,19 +102,17 @@ export async function POST(req: NextRequest) {
             try {
                 aiData = JSON.parse(aiText);
             } catch (e) {
-                console.error("Failed to parse JSON from AI response:", aiText);
                 aiData = extractJsonFallback(aiText);
             }
 
             return NextResponse.json({ ...aiData, transcript: transcriptText });
         } else {
-            console.log("[Phase 2] No valid transcript found at all.");
             return NextResponse.json({
-                error: "No transcript could be found for this video. This happens if the video is restricted, private, or doesn't have English captions. Please try a different video with captions enabled."
+                error: "Could not retrieve video transcript. This video might not have English captions or is restricted. Please try another video."
             }, { status: 500 });
         }
     } catch (error: any) {
-        console.error("Critical Failure:", error);
+        console.error("[Summarize] Critical error:", error);
         return NextResponse.json({ error: "Server error: " + (error.message || "Unknown error") }, { status: 500 });
     }
 }
@@ -161,14 +120,7 @@ export async function POST(req: NextRequest) {
 function extractJsonFallback(text: string) {
     try {
         const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-            return JSON.parse(jsonMatch[0]);
-        }
+        if (jsonMatch) return JSON.parse(jsonMatch[0]);
     } catch (e) { }
-
-    return {
-        summary: "Summary extraction failed.",
-        notes: text,
-        transcript: "Transcript extraction succeeded but parsing failed."
-    };
+    return { summary: "Summary generation failed.", notes: text, transcript: "Transcript extracted." };
 }
