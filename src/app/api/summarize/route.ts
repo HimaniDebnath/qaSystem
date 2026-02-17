@@ -40,8 +40,6 @@ export async function POST(req: NextRequest) {
         const body = await req.json().catch(() => ({}));
         const { url } = body;
 
-        console.log(`[Summarize] Processing URL: ${url}`);
-
         if (!url) return NextResponse.json({ error: "URL is required" }, { status: 400 });
         if (!process.env.GROQ_API_KEY) return NextResponse.json({ error: "Groq API Key missing" }, { status: 500 });
 
@@ -58,27 +56,52 @@ export async function POST(req: NextRequest) {
             const { YouTubeTranscriptApi } = await import("youtube-transcript-node");
             const api = new YouTubeTranscriptApi();
 
-            // Try fetching with default languages
-            const transcript = await api.fetch(videoId);
+            // 1. Get List of available transcripts
+            const list = await api.list(videoId);
+            console.log(`[Phase 1] Available tracks:`, list.toString());
 
-            // The library returns a FetchedTranscript object with a 'snippets' property
-            // We can also iterate over it directly as it implements Symbol.iterator
-            const snippets = (transcript as any).snippets || transcript;
+            // 2. Prioritize: English (Manual) -> English (Auto) -> Any English -> Any
+            let transcript;
+            try {
+                transcript = list.findManuallyCreatedTranscript(['en', 'en-US', 'en-GB']);
+            } catch (e) {
+                try {
+                    transcript = list.findGeneratedTranscript(['en', 'en-US', 'en-GB']);
+                } catch (e2) {
+                    try {
+                        transcript = list.findTranscript(['en', 'en-US', 'en-GB']);
+                    } catch (e3) {
+                        // Just take whatever is first if nothing English found
+                        const allTranscripts = [...list];
+                        if (allTranscripts.length > 0) {
+                            transcript = allTranscripts[0];
+                        }
+                    }
+                }
+            }
 
+            if (!transcript) {
+                throw new Error("No transcript tracks found for this video.");
+            }
+
+            console.log(`[Phase 1] Fetching chosen track: ${transcript.languageCode}`);
+            const fetched = await transcript.fetch();
+
+            const snippets = (fetched as any).snippets || fetched;
             if (snippets && Array.isArray(snippets) && snippets.length > 0) {
                 transcriptText = snippets.map((s: any) => s.text).join(" ");
                 console.log(`[Phase 1] Success! Extracted ${transcriptText.length} characters.`);
-            } else if (typeof transcript === 'object' && transcript !== null) {
-                // Handle cases where the object might have a different structure
-                console.log("[Phase 1] Transcript structure:", Object.keys(transcript));
             }
         } catch (e: any) {
             console.error("[Phase 1] Extraction failed:", e.message || e);
 
-            // Fallback error messaging
             if (e.message?.includes("Transcripts are disabled")) {
                 return NextResponse.json({ error: "Transcripts are disabled for this video." }, { status: 500 });
             }
+            if (e.message?.includes("No transcript found")) {
+                return NextResponse.json({ error: "No transcript was found for this video." }, { status: 500 });
+            }
+            return NextResponse.json({ error: `Transcript extraction failed: ${e.message}` }, { status: 500 });
         }
 
         if (transcriptText && transcriptText.length > 30) {
@@ -108,7 +131,7 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ ...aiData, transcript: transcriptText });
         } else {
             return NextResponse.json({
-                error: "Could not retrieve video transcript. This video might not have English captions or is restricted. Please try another video."
+                error: "Could not retrieve video transcript. This video might not have captions or is restricted. Please try another video."
             }, { status: 500 });
         }
     } catch (error: any) {

@@ -3,6 +3,9 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { db } from "@/db";
 import { documents } from "@/db/schema";
+
+export const maxDuration = 60;
+
 export async function POST(req: NextRequest) {
     // Polyfills for pdf-parse in Node.js environment
     if (typeof global.DOMMatrix === "undefined") {
@@ -17,6 +20,7 @@ export async function POST(req: NextRequest) {
 
     const { PDFParse } = require("pdf-parse");
     let parser = null;
+
     try {
         const session = await getServerSession(authOptions);
         if (!session || !session.user) {
@@ -34,7 +38,13 @@ export async function POST(req: NextRequest) {
         let content = "";
 
         if (file.type === "application/pdf") {
-            parser = new PDFParse({ data: buffer });
+            // Configuration for pdf-parse to avoid worker module issues on Vercel
+            // Setting disableWorker: true forces it to run in the main thread
+            parser = new PDFParse({
+                data: buffer,
+                disableWorker: true,
+                verbosity: -1 // Disable logs
+            });
             const data = await parser.getText();
             content = data.text;
         } else if (file.type === "text/plain") {
@@ -61,9 +71,9 @@ export async function POST(req: NextRequest) {
 
     } catch (error: any) {
         console.error("Upload error:", error);
-        return NextResponse.json({ error: error.message || "Failed to process upload" }, { status: 500 });
+        return NextResponse.json({ error: `Upload processing failed: ${error.message}` }, { status: 500 });
     } finally {
-        if (parser) {
+        if (parser && typeof parser.destroy === 'function') {
             try {
                 await parser.destroy();
             } catch (e) {
