@@ -40,6 +40,8 @@ export async function POST(req: NextRequest) {
         const body = await req.json().catch(() => ({}));
         const { url } = body;
 
+        console.log(`[Summarize] Processing URL: ${url}`);
+
         if (!url) return NextResponse.json({ error: "URL is required" }, { status: 400 });
         if (!process.env.GROQ_API_KEY) return NextResponse.json({ error: "Groq API Key missing" }, { status: 500 });
 
@@ -52,27 +54,29 @@ export async function POST(req: NextRequest) {
 
         // --- PHASE 1: TRANSCRIPT EXTRACTION ---
         try {
-            console.log(`[Phase 1] Using YouTubeTranscriptApi for: ${videoId}`);
+            console.log(`[Phase 1] Fetching transcripts for: ${videoId}`);
             const { YouTubeTranscriptApi } = await import("youtube-transcript-node");
             const api = new YouTubeTranscriptApi();
 
             // 1. Get List of available transcripts
             const list = await api.list(videoId);
-            console.log(`[Phase 1] Available tracks:`, list.toString());
 
-            // 2. Prioritize: English (Manual) -> English (Auto) -> Any English -> Any
+            // 2. Prioritize tracks
             let transcript;
             try {
+                // Try manual English
                 transcript = list.findManuallyCreatedTranscript(['en', 'en-US', 'en-GB']);
             } catch (e) {
                 try {
+                    // Try auto English
                     transcript = list.findGeneratedTranscript(['en', 'en-US', 'en-GB']);
                 } catch (e2) {
                     try {
+                        // Try any English
                         transcript = list.findTranscript(['en', 'en-US', 'en-GB']);
                     } catch (e3) {
-                        // Just take whatever is first if nothing English found
-                        const allTranscripts = [...list];
+                        // Fallback to literally anything available
+                        const allTranscripts = Array.from(list);
                         if (allTranscripts.length > 0) {
                             transcript = allTranscripts[0];
                         }
@@ -84,28 +88,26 @@ export async function POST(req: NextRequest) {
                 throw new Error("No transcript tracks found for this video.");
             }
 
-            console.log(`[Phase 1] Fetching chosen track: ${transcript.languageCode}`);
+            console.log(`[Phase 1] Fetching track: ${transcript.languageCode} (${transcript.isGenerated ? 'auto' : 'manual'})`);
             const fetched = await transcript.fetch();
-
             const snippets = (fetched as any).snippets || fetched;
             if (snippets && Array.isArray(snippets) && snippets.length > 0) {
                 transcriptText = snippets.map((s: any) => s.text).join(" ");
-                console.log(`[Phase 1] Success! Extracted ${transcriptText.length} characters.`);
             }
         } catch (e: any) {
-            console.error("[Phase 1] Extraction failed:", e.message || e);
-
+            console.error("[Phase 1] Failed:", e.message || e);
             if (e.message?.includes("Transcripts are disabled")) {
-                return NextResponse.json({ error: "Transcripts are disabled for this video." }, { status: 500 });
+                return NextResponse.json({ error: "Transcripts are disabled for this video. Use a video with captions." }, { status: 500 });
             }
-            if (e.message?.includes("No transcript found")) {
-                return NextResponse.json({ error: "No transcript was found for this video." }, { status: 500 });
+            if (e.message?.includes("No transcript tracks found")) {
+                return NextResponse.json({ error: "No captions found for this video. Please try a different video." }, { status: 500 });
             }
-            return NextResponse.json({ error: `Transcript extraction failed: ${e.message}` }, { status: 500 });
+            // Generic extraction failure
+            return NextResponse.json({ error: "Could not retrieve transcript. This often happens with restricted or very new videos." }, { status: 500 });
         }
 
         if (transcriptText && transcriptText.length > 30) {
-            console.log(`[Summarize] Generating AI summary...`);
+            console.log(`[Summarize] Generating summary (Text Length: ${transcriptText.length})`);
             const prompt = `Analyze the following YouTube transcript and provide:
             1. A concise summary of the main points (2-3 paragraphs).
             2. Structured study notes in Markdown format, with clear headings and bullet points.
@@ -131,12 +133,12 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ ...aiData, transcript: transcriptText });
         } else {
             return NextResponse.json({
-                error: "Could not retrieve video transcript. This video might not have captions or is restricted. Please try another video."
+                error: "The transcript for this video is empty or too short to summarize."
             }, { status: 500 });
         }
     } catch (error: any) {
         console.error("[Summarize] Critical error:", error);
-        return NextResponse.json({ error: "Server error: " + (error.message || "Unknown error") }, { status: 500 });
+        return NextResponse.json({ error: `Server error: ${error.message}` }, { status: 500 });
     }
 }
 
@@ -145,5 +147,5 @@ function extractJsonFallback(text: string) {
         const jsonMatch = text.match(/\{[\s\S]*\}/);
         if (jsonMatch) return JSON.parse(jsonMatch[0]);
     } catch (e) { }
-    return { summary: "Summary generation failed.", notes: text, transcript: "Transcript extracted." };
+    return { summary: "Summary generation failed.", notes: text };
 }
