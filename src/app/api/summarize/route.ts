@@ -1,14 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { YoutubeTranscript } from "youtube-transcript";
 import ytdl from "@distube/ytdl-core";
-import { spawn } from "child_process";
-import path from "path";
-import fs from "fs";
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 export const maxDuration = 60;
 
-const YTDLP_PATH = path.join(process.cwd(), ".venv/bin/yt-dlp");
+const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 async function callGroq(prompt: string): Promise<string> {
     const groqApiKey = process.env.GROQ_API_KEY;
@@ -23,10 +20,12 @@ async function callGroq(prompt: string): Promise<string> {
         body: JSON.stringify({
             model: "llama-3.3-70b-versatile",
             messages: [
+                { role: "system", content: "You are a specialized AI that summarizes YouTube videos and creates structured study notes. Always return valid JSON." },
                 { role: "user", content: prompt }
             ],
-            temperature: 0.3,
+            temperature: 0.2,
             max_tokens: 4096,
+            response_format: { type: "json_object" }
         }),
     });
 
@@ -55,107 +54,121 @@ export async function POST(req: NextRequest) {
 
         let transcriptText = "";
 
-        // --- PHASE 1: TRANSCRIPT SEARCH ---
+        // --- PHASE 1: TRANSCRIPT EXTRACTION ---
 
-        // method 1: YoutubeTranscript (Fastest)
+        // method 1: YoutubeTranscript
         try {
             console.log(`[Phase 1.1] YoutubeTranscript for: ${videoId}`);
             const transcript = await YoutubeTranscript.fetchTranscript(videoId);
             if (transcript && transcript.length > 0) {
-                transcriptText = transcript.map(t => t.text).join("\n");
-                console.log("[Phase 1.1] Success.");
+                transcriptText = transcript.map(t => t.text).join(" ");
+                console.log(`[Phase 1.1] Success (${transcriptText.length} chars)`);
             }
         } catch (e) {
-            console.warn("[Phase 1.1] Failed.");
+            console.warn("[Phase 1.1] Failed:", e instanceof Error ? e.message : "Unknown error");
         }
 
-        // method 2: yt-dlp subtitles (Local Robust)
-        if (!transcriptText && fs.existsSync(YTDLP_PATH)) {
+        // method 2: ytdl-core metadata (Fallback)
+        if (!transcriptText || transcriptText.length < 100) {
             try {
-                console.log(`[Phase 1.2] yt-dlp subtitles for: ${videoId}`);
-                transcriptText = await fetchSubtitleWithYtDlp(url);
-                if (transcriptText) console.log("[Phase 1.2] Success.");
-            } catch (e) {
-                console.warn("[Phase 1.2] Failed.");
-            }
-        }
-
-        // method 3: ytdl-core metadata (Vercel Fallback)
-        if (!transcriptText) {
-            try {
-                console.log(`[Phase 1.3] ytdl-core metadata for: ${videoId}`);
-                const info = await ytdl.getInfo(url);
-                const tracks = info.player_response.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-                if (tracks && tracks.length > 0) {
-                    const track = tracks.find((t: any) => t.languageCode === 'en') || tracks[0];
-                    if (track) {
-                        const res = await fetch(track.baseUrl);
-                        const xml = await res.text();
-                        transcriptText = xml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-                        console.log("[Phase 1.3] Success.");
+                console.log(`[Phase 1.2] @distube/ytdl-core metadata for: ${videoId}`);
+                const info = await ytdl.getInfo(url, {
+                    requestOptions: {
+                        headers: {
+                            "User-Agent": USER_AGENT,
+                        }
                     }
+                });
+
+                const tracks = info.player_response.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+
+                if (tracks && tracks.length > 0) {
+                    // Try to find English, then auto English, then any
+                    const track = tracks.find((t: any) => t.languageCode === 'en' && !t.kind) ||
+                        tracks.find((t: any) => t.languageCode === 'en') ||
+                        tracks.find((t: any) => t.languageCode.startsWith('en')) ||
+                        tracks[0];
+
+                    if (track) {
+                        console.log(`[Phase 1.2] Found track: ${track.languageCode} (${track.kind || 'manual'})`);
+                        const res = await fetch(track.baseUrl, {
+                            headers: { "User-Agent": USER_AGENT }
+                        });
+                        const xml = await res.text();
+
+                        const cleaned = xml
+                            .replace(/<[^>]+>/g, ' ')
+                            .replace(/&amp;/g, '&')
+                            .replace(/&lt;/g, '<')
+                            .replace(/&gt;/g, '>')
+                            .replace(/&quot;/g, '"')
+                            .replace(/&#39;/g, "'")
+                            .replace(/&nbsp;/g, ' ')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+
+                        if (cleaned.length > 50) { // Lowered threshold slightly
+                            transcriptText = cleaned;
+                            console.log(`[Phase 1.2] Success (${transcriptText.length} chars)`);
+                        }
+                    }
+                } else {
+                    console.log("[Phase 1.2] No caption tracks found in metadata");
                 }
             } catch (e) {
-                console.warn("[Phase 1.3] Failed.");
+                console.warn("[Phase 1.2] Failed:", e instanceof Error ? e.message : "Unknown error");
             }
         }
 
-        if (transcriptText && transcriptText.length > 100) {
+        if (transcriptText && transcriptText.length > 50) {
             console.log("[Groq] Processing via Transcript");
-            const prompt = `Analyze this YouTube transcript and generate:
-            1. A concise summary (2-3 paragraphs).
-            2. Structured study notes in markdown.
+            const prompt = `Analyze the following YouTube transcript and provide:
+            1. A concise summary of the main points (2-3 paragraphs).
+            2. Structured study notes in Markdown format, with clear headings and bullet points.
             
+            Return the result in this exact JSON format:
+            {
+              "summary": "The summary text...",
+              "notes": "## Study Notes\\n### Introduction\\n- Point 1..."
+            }
+
             Transcript:
-            ${transcriptText.substring(0, 20000)}
-            
-            Format as JSON: {"summary": "...", "notes": "..."}`;
+            ${transcriptText.substring(0, 30000)}
+            `;
 
             const aiText = await callGroq(prompt);
-            const aiData = extractJson(aiText);
+            let aiData;
+            try {
+                aiData = JSON.parse(aiText);
+            } catch (e) {
+                console.error("Failed to parse JSON from AI response:", aiText);
+                aiData = extractJsonFallback(aiText);
+            }
+
             return NextResponse.json({ ...aiData, transcript: transcriptText });
         } else {
-            // No transcript found — Groq doesn't support audio input like Gemini did
-            console.log("[Phase 2] No transcript found. Audio fallback not available with Groq.");
+            console.log("[Phase 2] No valid transcript found at all.");
             return NextResponse.json({
-                error: "Unable to extract transcript from this video. It might be too long, private, or age-restricted. Try a video with subtitles/captions enabled."
+                error: "No transcript could be found for this video. This happens if the video is restricted, private, or doesn't have English captions. Please try a different video with captions enabled."
             }, { status: 500 });
         }
     } catch (error: any) {
         console.error("Critical Failure:", error);
-        return NextResponse.json({ error: "Server encountered an error processing this request." }, { status: 500 });
+        return NextResponse.json({ error: "Server error: " + (error.message || "Unknown error") }, { status: 500 });
     }
 }
 
-// Helper: yt-dlp Subtitles
-async function fetchSubtitleWithYtDlp(url: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-        const proc = spawn(YTDLP_PATH, ['--dump-json', '--skip-download', '--write-auto-subs', '--sub-langs', 'en.*', url]);
-        let data = "";
-        proc.stdout.on('data', d => data += d);
-        proc.on('close', async (code) => {
-            if (code !== 0) return resolve("");
-            try {
-                const info = JSON.parse(data);
-                const autoSubs = info.automatic_captions || {};
-                const subs = info.subtitles || {};
-                const enSubs = subs.en || autoSubs.en;
-                if (!enSubs) return resolve("");
-                const format = enSubs.find((f: any) => f.ext === 'json3') || enSubs[0];
-                const res = await fetch(format.url);
-                const json = await res.json();
-                const text = json.events?.map((e: any) => e.segs ? e.segs.map((s: any) => s.utf8).join("") : "").join(" ") || "";
-                resolve(text);
-            } catch (e) { resolve(""); }
-        });
-    });
-}
-
-function extractJson(text: string) {
+function extractJsonFallback(text: string) {
     try {
         const jsonMatch = text.match(/\{[\s\S]*\}/);
-        return JSON.parse(jsonMatch ? jsonMatch[0] : text);
-    } catch {
-        return { summary: "Summary generation failed.", notes: text, transcript: "Transcript unavailable." };
-    }
+        if (jsonMatch) {
+            return JSON.parse(jsonMatch[0]);
+        }
+    } catch (e) { }
+
+    return {
+        summary: "Summary extraction failed.",
+        notes: text,
+        transcript: "Transcript extraction succeeded but parsing failed."
+    };
 }
